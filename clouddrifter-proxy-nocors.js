@@ -1,95 +1,108 @@
-/**
- * clouddrifter-proxy-nocors.js
- * 
- * Lightweight proxy — only rewrites playlists, segments go DIRECT.
- * Works perfectly in VLC (no CORS enforcement).
- * Zero bandwidth used for segments.
- * 
- * Usage:
- *   node clouddrifter-proxy-nocors.js
- *   
- * Then in VLC:
- *   http://localhost:3003/playlist?url=https://sxd.novaqueststudio.cyou/v4/xy/kyx9ax/cf-master.1778959912.txt
- */
-
 const express = require('express');
 const app = express();
-const PORT = 80;
+const PORT = 3003;
 
 const UPSTREAM_HEADERS = {
-  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
-  'Referer':         'https://clouddrifter.rpmvip.com/',
-  'Origin':          'https://clouddrifter.rpmvip.com',
-  'Accept':          '*/*',
-  'Accept-Language': 'en-US,en;q=0.9',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36',
+    'Referer': 'https://clouddrifter.rpmvip.com/',
+    'Origin': 'https://clouddrifter.rpmvip.com',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
 };
 
+// ---------------- HELPERS ----------------
+
 function resolveUrl(base, relative) {
-  try { return new URL(relative, base).href; }
-  catch { return relative; }
+    try { return new URL(relative, base).href; }
+    catch { return relative; }
 }
 
-function isPlaylist(url) {
-  return url.endsWith('.txt') || url.endsWith('.m3u8') || /cf-master|index-f|\.m3u/.test(url);
+function proxyUrl(req, targetUrl) {
+    const base = `${req.protocol}://${req.get('host')}`;
+    return `${base}/segment?url=${encodeURIComponent(targetUrl)}`;
 }
 
-function rewrite(text, base, proxyOrigin) {
-  return text.split('\n').map(line => {
-    const t = line.trim();
-    if (!t) return line;
+function rewriteM3u8(text, baseUrl, req) {
+    const baseHost = `${req.protocol}://${req.get('host')}`;
 
-    if (t.startsWith('#')) {
-      // URI tags — playlists go through proxy, segments go direct
-      return t.replace(/URI="([^"]+)"/g, (_, u) => {
-        const resolved = resolveUrl(base, u);
-        if (isPlaylist(resolved)) {
-          return `URI="${proxyOrigin}/playlist?url=${encodeURIComponent(resolved)}"`;
+    return text.split('\n').map(line => {
+        const trimmed = line.trim();
+        if (!trimmed) return line;
+
+        if (trimmed.startsWith('#')) {
+            return trimmed.replace(/URI="([^"]+)"/, (m, uri) => {
+                const resolved = resolveUrl(baseUrl, uri);
+                return `URI="${proxyUrl(req, resolved)}"`;
+            });
         }
-        // Segment direct — no proxy
-        return `URI="${resolved}"`;
-      });
-    }
 
-    const resolved = resolveUrl(base, t);
+        const resolved = resolveUrl(baseUrl, trimmed);
 
-    if (isPlaylist(resolved)) {
-      return `${proxyOrigin}/playlist?url=${encodeURIComponent(resolved)}`;
-    }
+        if (resolved.endsWith('.txt') || resolved.includes('cf-master')) {
+            return `${baseHost}/playlist?url=${encodeURIComponent(resolved)}`;
+        }
 
-    // Segment goes DIRECT to upstream — VLC handles it fine
-    return resolved;
-  }).join('\n');
+        return proxyUrl(req, resolved);
+    }).join('\n');
 }
+
+// ---------------- CORS ----------------
 
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
 });
+
+// ---------------- PLAYLIST ----------------
 
 app.get('/playlist', async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).send('Missing ?url=');
+    const url = req.query.url;
+    if (!url) return res.status(400).send('Missing ?url=');
 
-  try {
-    const r = await fetch(url, { headers: UPSTREAM_HEADERS });
-    if (!r.ok) return res.status(r.status).send(`Upstream ${r.status}`);
+    try {
+        const r = await fetch(url, { headers: UPSTREAM_HEADERS });
 
-    const proxyOrigin = `${req.protocol}://${req.get('host')}`;
-    const text = rewrite(await r.text(), url, proxyOrigin);
+        if (!r.ok) return res.status(r.status).send('Upstream error');
 
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.send(text);
-  } catch (err) {
-    res.status(500).send(err.message);
-  }
+        const text = await r.text();
+        const rewritten = rewriteM3u8(text, url, req);
+
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(rewritten);
+
+    } catch (err) {
+        res.status(500).send(err.message);
+    }
 });
 
+// ---------------- SEGMENT ----------------
+
+app.get('/segment', async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.status(400).send('Missing ?url=');
+
+    try {
+        const r = await fetch(url, { headers: UPSTREAM_HEADERS });
+
+        if (!r.ok) return res.status(r.status).send('Upstream error');
+
+        res.setHeader('Content-Type', 'video/mp2t');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+
+        const buf = await r.arrayBuffer();
+        res.send(Buffer.from(buf));
+
+    } catch (err) {
+        res.status(500).send(err.message);
+    }
+});
+
+// ---------------- START ----------------
+
 app.listen(PORT, () => {
-  console.log(`\nClouddrifter Proxy (no-cors mode) — port ${PORT}`);
-  console.log(`Playlists proxied, segments go DIRECT`);
-  console.log(`http://localhost:${PORT}/playlist?url=<cf-master-url>\n`);
+    console.log(`Proxy running on http://localhost:${PORT}`);
 });
