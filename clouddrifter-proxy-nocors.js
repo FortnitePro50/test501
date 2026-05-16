@@ -14,7 +14,7 @@
 
 const express = require('express');
 const app = express();
-const PORT = 3003;
+const PORT = 80;
 
 const UPSTREAM_HEADERS = {
   'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
