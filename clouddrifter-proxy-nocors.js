@@ -1,97 +1,139 @@
-const express = require('express');
+/**
+ * clean-hls-proxy.js
+ * VLC + browser compatible HLS proxy
+ */
+
+const express = require("express");
 const app = express();
 const PORT = 80;
 
-const UPSTREAM = {
-  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
-  'Referer':         'https://clouddrifter.rpmvip.com/',
-  'Origin':          'https://clouddrifter.rpmvip.com',
-  'Accept':          '*/*',
-  'Accept-Language': 'en-US,en;q=0.9',
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+  Referer: "https://clouddrifter.rpmvip.com/",
+  Origin: "https://clouddrifter.rpmvip.com",
 };
 
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
-
-app.get('/playlist', async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.status(400).send('Missing ?url=');
-
+// -----------------------------
+// UTIL
+// -----------------------------
+function resolve(base, url) {
   try {
-    const r = await fetch(target, { headers: UPSTREAM });
-    if (!r.ok) return res.status(r.status).send(`Upstream ${r.status}`);
-
-    const origin = `${req.protocol}://${req.get('host')}`;
-    const text = rewrite(await r.text(), target, origin);
-
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Cache-Control', 'no-cache, no-store');
-    res.send(text);
-  } catch (err) {
-    res.status(500).send(err.message);
+    return new URL(url, base).href;
+  } catch {
+    return url;
   }
-});
-
-app.head('/segment', (req, res) => {
-  res.setHeader('Content-Type', 'video/mp2t');
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.sendStatus(200);
-});
-
-app.get('/segment', async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.status(400).send('Missing ?url=');
-
-  try {
-    const r = await fetch(target, { headers: UPSTREAM });
-    if (!r.ok) return res.status(r.status).send(`Upstream ${r.status}`);
-
-    const buf = await r.arrayBuffer();
-    res.setHeader('Content-Type', 'video/mp2t');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Content-Length', buf.byteLength);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.send(Buffer.from(buf));
-  } catch (err) {
-    res.status(500).send(err.message);
-  }
-});
-
-function isPlaylist(url) {
-  return url.endsWith('.txt') || url.endsWith('.m3u8') || /cf-master|index-f|\.m3u/.test(url);
 }
 
-function rewrite(text, base, origin) {
-  return text.split('\n').map(line => {
-    const t = line.trim();
-    if (!t) return line;
+// -----------------------------
+// PLAYLIST PROXY (NO OVER-REWRITE)
+// -----------------------------
+app.get("/playlist", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send("Missing url");
 
-    if (t.startsWith('#')) {
-      return t.replace(/URI="([^"]+)"/g, (_, u) => {
-        const resolved = resolve(base, u);
-        const route = isPlaylist(resolved) ? 'playlist' : 'segment';
-        return `URI="${origin}/${route}?url=${encodeURIComponent(resolved)}"`;
-      });
+  try {
+    const r = await fetch(url, { headers: HEADERS });
+    if (!r.ok) return res.status(500).send("Upstream error");
+
+    let text = await r.text();
+
+    const base = url;
+
+    // ONLY fix segment URLs, keep VLC happy
+    text = text
+      .split("\n")
+      .map((line) => {
+        const l = line.trim();
+
+        // ignore tags
+        if (!l || l.startsWith("#")) return line;
+
+        const abs = resolve(base, l);
+
+        // proxy EVERYTHING through segment endpoint
+        return `${req.protocol}://${req.get("host")}/segment?url=${encodeURIComponent(
+          abs
+        )}`;
+      })
+      .join("\n");
+
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Cache-Control", "no-cache");
+    res.send(text);
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
+// -----------------------------
+// SEGMENT PROXY (VLC FRIENDLY)
+// -----------------------------
+app.get("/segment", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send("Missing url");
+
+  try {
+    const range = req.headers.range;
+
+    const r = await fetch(url, {
+      headers: {
+        ...HEADERS,
+        Range: range || "",
+      },
+    });
+
+    if (!r.ok && r.status !== 206) {
+      return res.status(r.status).send("Segment error");
     }
 
-    const url = resolve(base, t);
-    const route = isPlaylist(url) ? 'playlist' : 'segment';
-    return `${origin}/${route}?url=${encodeURIComponent(url)}`;
-  }).join('\n');
-}
+    res.status(r.status);
 
-function resolve(base, rel) {
-  try { return new URL(rel, base).href; }
-  catch { return rel; }
-}
+    // IMPORTANT: VLC expects TS
+    res.setHeader("Content-Type", "video/mp2t");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "public, max-age=3600");
 
+    if (r.headers.get("content-range")) {
+      res.setHeader("Content-Range", r.headers.get("content-range"));
+    }
+
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.send(buf);
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
+// -----------------------------
+// SIMPLE VLC TEST PAGE
+// -----------------------------
+app.get("/", (req, res) => {
+  res.send(`
+<!doctype html>
+<html>
+<body style="background:#111;color:#fff;font-family:Arial;padding:20px">
+<h2>HLS Proxy (VLC Ready)</h2>
+
+<input id="u" style="width:80%" placeholder="paste m3u8 (.txt) url"/>
+<button onclick="go()">Play</button>
+
+<p>Use in VLC:</p>
+<code>http://localhost:${PORT}/playlist?url=YOUR_URL</code>
+
+<script>
+function go(){
+  const u = document.getElementById('u').value;
+  window.location.href = '/playlist?url=' + encodeURIComponent(u);
+}
+</script>
+
+</body>
+</html>
+  `);
+});
+
+// -----------------------------
 app.listen(PORT, () => {
-  console.log(`\nClouddrifter Express Proxy — port ${PORT}`);
-  console.log(`http://localhost:${PORT}/playlist?url=<cf-master-url>\n`);
+  console.log("HLS Proxy running on", PORT);
 });
